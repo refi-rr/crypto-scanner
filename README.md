@@ -11,8 +11,7 @@ Crypto Scanner with features:
 | **Oscillator**         | RSI                                                 | Deteksi overbought/oversold                 | ✅ Sudah sebagian |
 | **Multi-Timeframe**    | Perbandingan sinyal antar TF (mis. 15m, 1h, 4h, 1d) | Konfirmasi makro–mikro trend                | ✅ Sudah          |
 
-
-3. Kemampuan trading/analisis
+**Kemampuan trading/analisis**
 
 Aplikasi bisa melakukan:
 
