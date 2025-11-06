@@ -171,7 +171,7 @@ st.title("🚀 Crypto Futures Scanner v4.9.0")
 # ======================
 # TAB LAYOUT START
 # ======================
-tab_market, tab_single, tab_sentiment = st.tabs(["📊 Market Scanner", "🎯 Single Scanner", "🫣 Sentiment"])
+tab_market, tab_single, tab_sentiment, tab_chatgpt = st.tabs(["📊 Market Scanner", "🎯 Single Scanner", "🫣 Sentiment", " 🤖 ChatGPT"])
 
 # ===================================================
 # TAB 1 — MARKET SCANNER (original full functionality)
@@ -249,6 +249,21 @@ with tab_market:
 
                 
                 #API FnG
+
+                def get_fear_greed_history(limit=30):
+                    """
+                    Fetch Fear & Greed Index (historical)
+                    """
+                    url = f"https://api.alternative.me/fng/?limit={limit}&format=json"
+                    r = requests.get(url).json()
+                    data = r.get("data", [])
+                    df = pd.DataFrame(data)
+                    if not df.empty:
+                        df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s")
+                        df["value"] = df["value"].astype(int)
+                        df = df.sort_values("timestamp")
+                    return df
+
                 def get_fear_greed_index():
                     url = "https://api.alternative.me/fng/"
                     r = requests.get(url).json()
@@ -256,11 +271,49 @@ with tab_market:
                     classification = r["data"][0]["value_classification"]
                     return int(value), classification
 
+                # --- Streamlit UI ---
                 st.markdown("---")
                 st.markdown("### 📊 Market Overview")
+
+                # Current FNG
                 value, cls = get_fear_greed_index()
                 st.metric("😨 Fear & Greed Index", f"{value} ({cls})")
-                st.caption("Live data from CoinGecko (auto-updated every 5 minutes).")
+
+                # Historical chart
+                df_fng = get_fear_greed_history(limit=90)
+                if not df_fng.empty:
+                    fig = go.Figure()
+
+                    # Area plot with color scale
+                    fig.add_trace(go.Scatter(
+                        x=df_fng["timestamp"],
+                        y=df_fng["value"],
+                        mode="lines+markers",
+                        fill="tozeroy",
+                        line=dict(color="#00bcd4", width=2),
+                        marker=dict(size=5, color=df_fng["value"], colorscale="RdYlGn", showscale=True),
+                        name="Fear & Greed Index",
+                    ))
+
+                    # Thresholds
+                    fig.add_hline(y=25, line_dash="dot", line_color="red", annotation_text="Extreme Fear", annotation_position="top left")
+                    fig.add_hline(y=50, line_dash="dot", line_color="orange", annotation_text="Neutral", annotation_position="top left")
+                    fig.add_hline(y=75, line_dash="dot", line_color="green", annotation_text="Extreme Greed", annotation_position="top left")
+
+                    fig.update_layout(
+                        height=360,
+                        template="plotly_dark" if st.get_option("theme.base") == "dark" else "plotly_white",
+                        title="Fear & Greed Index (Last 90 Days)",
+                        xaxis_title="Date",
+                        yaxis_title="Index Value",
+                        yaxis=dict(range=[0, 100]),
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning("Failed to fetch Fear & Greed Index data.")
+
+                st.caption("Live data from alternative.me — updated every 24h. Lower = Fear 😨, Higher = Greed 😈")
     
     simple_trading_sessions()
 
@@ -662,4 +715,69 @@ with tab_sentiment:
     # Tampilkan HTML di Streamlit
     st.components.v1.html(calendar_html, height=800)
 
+# ===================================================
+# TAB 4 — ChatGPT 5.0
+# ===================================================
+with tab_chatgpt:
+    # ---- Tab 3: GPT Analyst ----
+    st.header("🧠 GPT Analyst Playground")
+
+    st.markdown("Paste reasoning output from your scanner below. The AI will analyze and summarize the context.")
+
+    input_text = st.text_area("📋 Paste your technical reasoning here:", height=200, placeholder="[1h] EMA9<EMA21 (bear)\n[1h] Supertrend down\n...")
+
+    col1, col2 = st.columns([0.7, 0.3])
+    with col1:
+        model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-5-nano"], index=1)
+    with col2:
+        analyze = st.button("🔍 Analyze with GPT", use_container_width=True)
+
+    if analyze:
+        if not input_text.strip():
+            st.warning("Please paste reasoning text first.")
+            from openai import OpenAI
+            import os
+
+            api_key = os.getenv("OPENAI_API_KEY", "")
+            if not api_key:
+                with st.sidebar:
+                    api_key = st.text_input("🔑 Enter your OpenAI API key", type="password")
+
+            if not api_key:
+                st.warning("Please provide an OpenAI API key to use GPT Analyst.")
+            else:
+                try:
+                    client = OpenAI(api_key=api_key)
+
+                    prompt = f"""
+                    You are a professional technical market analyst.
+                    Interpret the following trading reasoning and summarize the market context:
+                    {input_text}
+
+                    Provide a short summary including:
+                    - Market bias (bullish/bearish/neutral)
+                    - Strength of conviction
+                    - Risk level (low/medium/high)
+                    - Concise reasoning (2-3 sentences)
+                    """
+
+                    with st.spinner("Analyzing reasoning with GPT..."):
+                        resp = client.responses.create(model=model, input=prompt)
+
+                        # Compatible extraction (v1+ OpenAI SDK)
+                        try:
+                            output = resp.output[0].content[0].text.strip()
+                        except Exception:
+                            output = getattr(resp, "output_text", "").strip() or str(resp)
+
+                    st.success("✅ GPT Analysis Complete")
+                    st.markdown("### 💡 GPT Summary")
+                    st.write(output)
+
+                except Exception as e:
+                    st.error(f"Failed to analyze with GPT: {e}")    
+                
+
+
 st.caption("v4.9.0 — Dual Tab UI (Market + Single) with unified chart renderer")
+#client = OpenAI(api_key=os.getenv("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"))
