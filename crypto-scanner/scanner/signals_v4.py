@@ -20,7 +20,9 @@ BASE_WEIGHTS = {
     "stoch": 0.15,
     "rsi": 0.10,
     "obv": 0.10,
-    "supertrend": 0.20
+    "supertrend": 0.20,
+    "vwap": 0.10,
+    "ha_slope": 0.05
 }
 
 # normalize score to [-1,1]
@@ -40,155 +42,226 @@ def _per_tf_signal(df):
     - score_norm: float between -1 to 1 (negative bearish, positive bullish)
     """
     reasons = []
+    # hard guard
     if df is None or len(df) < 3:
         return {"signal": 0, "score": 0.0, "reasons": ["no_data"]}
 
-    # use last row
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
 
-    # EMA trend: compare ema_9 vs ema_21 and relative to ema_50
+    # ---------- initialize all scores up front (no scope surprises) ----------
     ema_score = 0.0
+    macd_score = 0.0
+    stoch_score = 0.0
+    rsi_score = 0.0
+    obv_score = 0.0
+    super_score = 0.0
+    vwap_score = 0.0
+    adx_factor = 1.0
+    chop_factor = 1.0
+
+    # ---------- EMA trend ----------
     try:
         if last.get("ema_9") is not None and last.get("ema_21") is not None:
             if last["ema_9"] > last["ema_21"]:
                 ema_score = 1.0
-                reasons.append(f"EMA9>{'EMA21'} (bull)")
+                reasons.append("EMA9>EMA21 (bull)")
             elif last["ema_9"] < last["ema_21"]:
                 ema_score = -1.0
-                reasons.append(f"EMA9<EMA21 (bear)")
+                reasons.append("EMA9<EMA21 (bear)")
     except Exception:
-        ema_score = 0.0
+        pass
 
-    # MACD cross
-    macd_score = 0.0
+    # ---------- MACD ----------
     try:
-        macd = last.get("macd")
-        macd_sig = last.get("macd_signal")
-        prev_macd = prev.get("macd")
-        prev_sig = prev.get("macd_signal")
-        if macd is not None and macd_sig is not None and prev_macd is not None and prev_sig is not None:
-            # golden cross
-            if prev_macd < prev_sig and macd > macd_sig:
-                macd_score = 1.0
-                reasons.append("MACD golden_cross")
-            elif prev_macd > prev_sig and macd < macd_sig:
-                macd_score = -1.0
-                reasons.append("MACD death_cross")
+        macd = last.get("macd"); macd_sig = last.get("macd_signal")
+        pm = prev.get("macd");   ps = prev.get("macd_signal")
+        if macd is not None and macd_sig is not None and pm is not None and ps is not None:
+            if pm < ps and macd > macd_sig:
+                macd_score = 1.0; reasons.append("MACD golden_cross")
+            elif pm > ps and macd < macd_sig:
+                macd_score = -1.0; reasons.append("MACD death_cross")
             else:
-                # momentum direction
                 macd_score = 0.5 if macd > macd_sig else -0.5 if macd < macd_sig else 0.0
     except Exception:
-        macd_score = 0.0
+        pass
 
-    # Stoch RSI
-    stoch_score = 0.0
+    # ---------- StochRSI ----------
     try:
-        k = last.get("stoch_k")
-        d = last.get("stoch_d")
-        if k is not None and d is not None:
-            # oversold -> bullish reversal if cross up under 20
-            if prev.get("stoch_k") is not None and prev.get("stoch_d") is not None:
-                if prev["stoch_k"] < prev["stoch_d"] and k > d and k < 0.2:
-                    stoch_score = 1.0
-                    reasons.append("StochRSI cross (oversold) bullish")
-                elif prev["stoch_k"] > prev["stoch_d"] and k < d and k > 0.8:
-                    stoch_score = -1.0
-                    reasons.append("StochRSI cross (overbought) bearish")
-                else:
-                    # momentum
-                    stoch_score = 0.4 if k > d else -0.4 if k < d else 0.0
+        k = last.get("stoch_k"); d = last.get("stoch_d")
+        pk = prev.get("stoch_k"); pd_ = prev.get("stoch_d")
+        if k is not None and d is not None and pk is not None and pd_ is not None:
+            if pk < pd_ and k > d and k < 0.2:
+                stoch_score = 1.0; reasons.append("StochRSI cross (oversold) bullish")
+            elif pk > pd_ and k < d and k > 0.8:
+                stoch_score = -1.0; reasons.append("StochRSI cross (overbought) bearish")
+            else:
+                stoch_score = 0.4 if k > d else -0.4 if k < d else 0.0
     except Exception:
-        stoch_score = 0.0
+        pass
 
-    # RSI zones
-    rsi_score = 0.0
+    # ---------- RSI ----------
     try:
         r = last.get("rsi")
         if r is not None:
             if r < 30:
-                rsi_score = 0.6
-                reasons.append("RSI oversold")
+                rsi_score = 0.6; reasons.append("RSI oversold")
             elif r > 70:
-                rsi_score = -0.6
-                reasons.append("RSI overbought")
+                rsi_score = -0.6; reasons.append("RSI overbought")
             else:
-                # directional tweak
                 rsi_score = 0.1 if r > 50 else -0.1
     except Exception:
-        rsi_score = 0.0
+        pass
 
-    # OBV trend (compare last vs mean)
-    obv_score = 0.0
+    # MFI (Money Flow Index)
+    mfi_score = 0.0
+    try:
+        mfi = last.get("mfi")
+        if mfi is not None and not np.isnan(mfi):
+            if mfi < 20:
+                mfi_score = 0.6
+                reasons.append(f"MFI {round(mfi,1)} oversold (buy pressure)")
+            elif mfi > 80:
+                mfi_score = -0.6
+                reasons.append(f"MFI {round(mfi,1)} overbought (sell pressure)")
+            else:
+                # subtle bias
+                mfi_score = 0.1 if mfi > 50 else -0.1
+    except Exception:
+        mfi_score = 0.0
+
+
+    # ---------- OBV ----------
     try:
         obv = last.get("obv")
-        if obv is not None:
-            m = df['obv'].rolling(30, min_periods=1).mean().iloc[-1]
+        if obv is not None and "obv" in df.columns:
+            m = df["obv"].rolling(30, min_periods=1).mean().iloc[-1]
             obv_score = 0.25 if obv > m else -0.25
-            if obv > m:
-                reasons.append("OBV > MA30 (buy pressure)")
-            else:
-                reasons.append("OBV < MA30 (sell pressure)")
+            reasons.append("OBV > MA30 (buy pressure)" if obv > m else "OBV < MA30 (sell pressure)")
     except Exception:
-        obv_score = 0.0
+        pass
 
-    # Supertrend direction (True = uptrend)
-    super_score = 0.0
+    # ---------- Supertrend ----------
     try:
         if last.get("supertrend_dir") is not None:
-            if last["supertrend_dir"]:
-                super_score = 1.0
-                reasons.append("Supertrend up")
+            if bool(last["supertrend_dir"]):
+                super_score = 1.0; reasons.append("Supertrend up")
             else:
-                super_score = -1.0
-                reasons.append("Supertrend down")
+                super_score = -1.0; reasons.append("Supertrend down")
     except Exception:
-        super_score = 0.0
+        pass
 
-    # ADX strength filter (if ADX low, damp signals)
-    adx = last.get("adx") or 0.0
-    adx_factor = 1.0
-    if adx < 20:
-        adx_factor = 0.6
-        reasons.append("Weak trend (ADX<20)")
+    # ---------- VWAP (robust) ----------
+    try:
+        if "vwap" in df.columns:
+            v = last.get("vwap", None)
+            if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                if last["close"] > v:
+                    vwap_score = 0.5; reasons.append("Price above VWAP (bullish bias)")
+                elif last["close"] < v:
+                    vwap_score = -0.5; reasons.append("Price below VWAP (bearish bias)")
+    except Exception as e:
+        reasons.append(f"VWAP calc error: {type(e).__name__}")
+    
+    # Heikin Ashi slope (trend consistency)
+    ha_score = 0.0
+    try:
+        slope = last.get("ha_slope")
+        if slope is not None and not np.isnan(slope):
+            if slope > 0:
+                ha_score = 0.5
+                reasons.append("Heikin Ashi slope rising (trend intact)")
+            elif slope < 0:
+                ha_score = -0.5
+                reasons.append("Heikin Ashi slope falling (trend weakening)")
+    except Exception:
+        ha_score = 0.0
 
-    # Weighted aggregation
+
+    # ---------- ADX strength filter ----------
+    try:
+        adx = last.get("adx") or 0.0
+        if adx < 20:
+            adx_factor = 0.6
+            reasons.append("Weak trend (ADX<20)")
+    except Exception:
+        adx_factor = 1.0
+
+    # ---------- CHOP regime (robust, always defined) ----------
+    try:
+        cval = last.get("chop", 50.0)
+        if cval is None or (isinstance(cval, float) and np.isnan(cval)):
+            cval = 50.0
+        if cval > 60:
+            chop_factor = 0.7; reasons.append(f"High CHOP {round(float(cval),1)} (ranging)")
+        elif cval < 35:
+            chop_factor = 1.1; reasons.append(f"Low CHOP {round(float(cval),1)} (trending)")
+        else:
+            chop_factor = 1.0
+    except Exception as e:
+        chop_factor = 1.0
+        reasons.append(f"CHOP calc error: {type(e).__name__}")
+    
+        # ---------- Candle Pattern Reasoning ----------
+    try:
+        if "pattern" in df.columns:
+            last_pattern = df["pattern"].dropna().iloc[-1] if not df["pattern"].dropna().empty else None
+            if last_pattern:
+                if "Hammer" in last_pattern:
+                    reasons.append(f"{last_pattern} (bullish reversal)")
+                elif "Shooting Star" in last_pattern:
+                    reasons.append(f"{last_pattern} (bearish reversal)")
+                elif "Engulfing" in last_pattern:
+                    if "Bullish" in last_pattern:
+                        reasons.append(f"{last_pattern} pattern (bullish momentum shift)")
+                    else:
+                        reasons.append(f"{last_pattern} pattern (bearish momentum shift)")
+                elif last_pattern == "Doji":
+                    reasons.append("Doji (market indecision)")
+                elif last_pattern == "Marubozu":
+                    reasons.append("Marubozu (strong trend continuation)")
+                elif last_pattern == "Morning Star":
+                    reasons.append("Morning Star (bullish reversal pattern)")
+                elif last_pattern == "Evening Star":
+                    reasons.append("Evening Star (bearish reversal pattern)")
+                elif last_pattern == "Three White Soldiers":
+                    reasons.append("Three White Soldiers (strong bullish continuation)")
+                elif last_pattern == "Three Black Crows":
+                    reasons.append("Three Black Crows (strong bearish continuation)")
+                elif last_pattern == "Bullish Harami":
+                    reasons.append("Bullish Harami (potential bullish reversal)")
+                elif last_pattern == "Bearish Harami":
+                    reasons.append("Bearish Harami (potential bearish reversal)")
+    except Exception:
+        pass
+
+
+    # ---------- Weighted aggregation ----------
     total_weight = 0.0
     weighted = 0.0
-
-    # mapping
     mapping = [
-        ("ema", ema_score, BASE_WEIGHTS["ema"]),
-        ("macd", macd_score, BASE_WEIGHTS["macd"]),
-        ("stoch", stoch_score, BASE_WEIGHTS["stoch"]),
-        ("rsi", rsi_score, BASE_WEIGHTS["rsi"]),
-        ("obv", obv_score, BASE_WEIGHTS["obv"]),
+        ("ema",        ema_score,   BASE_WEIGHTS["ema"]),
+        ("macd",       macd_score,  BASE_WEIGHTS["macd"]),
+        ("stoch",      stoch_score, BASE_WEIGHTS["stoch"]),
+        ("rsi",        rsi_score,   BASE_WEIGHTS["rsi"]),
+        ("obv",        obv_score,   BASE_WEIGHTS["obv"]),
         ("supertrend", super_score, BASE_WEIGHTS["supertrend"]),
+        ("vwap",       vwap_score,  BASE_WEIGHTS.get("vwap", 0.10)),
+        ("ha_slope", ha_score, BASE_WEIGHTS["ha_slope"]),
     ]
-    for name, sc, w in mapping:
-        if sc is None:
+    for _, sc, w in mapping:
+        if sc is None or w is None:
             continue
         weighted += sc * w
         total_weight += w
 
-    if total_weight == 0:
-        score = 0.0
-    else:
-        score = (weighted / total_weight) * adx_factor
-
-    # normalize between -1 and 1 (it should already be in that range)
+    score = 0.0 if total_weight == 0 else (weighted / total_weight) * adx_factor * chop_factor
     score = max(-1.0, min(1.0, score))
 
-    # decide signal
-    sig = 0
-    if score >= 0.35:
-        sig = 1
-    elif score <= -0.35:
-        sig = -1
-    else:
-        sig = 0
+    sig = 1 if score >= 0.35 else -1 if score <= -0.35 else 0
+    return {"signal": sig, "score": float(score), "reasons": reasons}
 
-    return {"signal": sig, "score": score, "reasons": reasons}
+
 
 def evaluate_signals_mtf(dfs):
     """
