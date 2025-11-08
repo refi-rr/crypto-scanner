@@ -132,11 +132,175 @@ def _adx(df, period=14):
     adx = dx.ewm(alpha=1/period, adjust=False).mean().fillna(0)
     return adx
 
+# --- New indicators: CHOP (Choppiness Index) + VWAP ---
+
+def _choppiness(df, period=14):
+    """Choppiness Index: 0–100, tinggi = ranging, rendah = trending."""
+    try:
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift(1)).abs(),
+            (df['low'] - df['close'].shift(1)).abs()
+        ], axis=1).max(axis=1)
+        atr_sum = tr.rolling(period).sum()
+        high_max = df['high'].rolling(period).max()
+        low_min = df['low'].rolling(period).min()
+        chop = 100 * np.log10(atr_sum / (high_max - low_min)) / np.log10(period)
+        return chop.clip(0, 100)
+    except Exception:
+        return pd.Series(np.nan, index=df.index)
+
+def _vwap(df):
+    """Volume Weighted Average Price."""
+    try:
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        cum_vol = df['volume'].cumsum()
+        cum_vol_price = (typical_price * df['volume']).cumsum()
+        return cum_vol_price / cum_vol
+    except Exception:
+        return pd.Series(np.nan, index=df.index)
+
+def detect_candle_patterns(df):
+    """
+    Advanced candle pattern detection (12 patterns total):
+    Hammer, Shooting Star, Bullish/Bearish Engulfing, Doji, Marubozu,
+    Morning Star, Evening Star, Three White Soldiers, Three Black Crows,
+    Bullish Harami, Bearish Harami.
+    """
+
+    if df is None or len(df) < 5:
+        df["pattern"] = None
+        return df
+
+    df = df.copy()
+    df["pattern"] = None
+
+    for i in range(2, len(df)):
+        o, h, l, c = df.iloc[i][["open", "high", "low", "close"]]
+        po, ph, pl, pc = df.iloc[i - 1][["open", "high", "low", "close"]]
+        p2o, p2h, p2l, p2c = df.iloc[i - 2][["open", "high", "low", "close"]]
+
+        body = abs(c - o)
+        upper_shadow = h - max(o, c)
+        lower_shadow = min(o, c) - l
+        range_ = max(h - l, 1e-9)
+
+        # 1. Hammer
+        if lower_shadow > 2 * body and c > o:
+            df.loc[df.index[i], "pattern"] = "Hammer"
+
+        # 2. Shooting Star
+        elif upper_shadow > 2 * body and c < o:
+            df.loc[df.index[i], "pattern"] = "Shooting Star"
+
+        # 3. Bullish Engulfing
+        elif pc < po and c > o and c > po and o < pc:
+            df.loc[df.index[i], "pattern"] = "Bullish Engulfing"
+
+        # 4. Bearish Engulfing
+        elif pc > po and c < o and c < po and o > pc:
+            df.loc[df.index[i], "pattern"] = "Bearish Engulfing"
+
+        # 5. Doji
+        elif body <= 0.1 * range_:
+            df.loc[df.index[i], "pattern"] = "Doji"
+
+        # 6. Marubozu (no shadows)
+        elif (upper_shadow <= 0.05 * range_) and (lower_shadow <= 0.05 * range_):
+            df.loc[df.index[i], "pattern"] = "Marubozu"
+
+        # 7. Morning Star (3-candle bullish reversal)
+        elif (
+            p2c < p2o and  # bearish first
+            abs(pc - po) <= abs(p2o - p2c) * 0.6 and  # small second candle
+            c > (p2o + p2c) / 2  # bullish close into first candle body
+        ):
+            df.loc[df.index[i], "pattern"] = "Morning Star"
+
+        # 8. Evening Star (3-candle bearish reversal)
+        elif (
+            p2c > p2o and
+            abs(pc - po) <= abs(p2o - p2c) * 0.6 and
+            c < (p2o + p2c) / 2
+        ):
+            df.loc[df.index[i], "pattern"] = "Evening Star"
+
+        # 9. Three White Soldiers
+        elif (
+            p2c > p2o and pc > po and c > o and
+            c > pc and pc > p2c and
+            o > po and po > p2o
+        ):
+            df.loc[df.index[i], "pattern"] = "Three White Soldiers"
+
+        # 10. Three Black Crows
+        elif (
+            p2c < p2o and pc < po and c < o and
+            c < pc and pc < p2c and
+            o < po and po < p2o
+        ):
+            df.loc[df.index[i], "pattern"] = "Three Black Crows"
+
+        # 11. Bullish Harami
+        elif (
+            pc < po and c > o and
+            c < po and o > pc
+        ):
+            df.loc[df.index[i], "pattern"] = "Bullish Harami"
+
+        # 12. Bearish Harami
+        elif (
+            pc > po and c < o and
+            c > po and o < pc
+        ):
+            df.loc[df.index[i], "pattern"] = "Bearish Harami"
+
+    return df
+
+
+
 def compute_indicators(df):
     """
     Compute and attach indicators to df. Safely returns df unchanged if invalid input.
     """
+    # MFI (Money Flow Index)
+    try:
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        money_flow = typical_price * df['volume']
+        pos_flow = np.where(typical_price > typical_price.shift(1), money_flow, 0.0)
+        neg_flow = np.where(typical_price < typical_price.shift(1), money_flow, 0.0)
+        pos_mf = pd.Series(pos_flow).rolling(14, min_periods=1).sum()
+        neg_mf = pd.Series(neg_flow).rolling(14, min_periods=1).sum()
+        money_ratio = (pos_mf / neg_mf.replace(0, np.nan))
+        df['mfi'] = 100 - (100 / (1 + money_ratio))
+        df['mfi'] = df['mfi'].clip(0, 100)
+    except Exception:
+        df['mfi'] = np.nan
+
+    # Heikin Ashi slope
+    try:
+        ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+        ha_open = (df['open'].shift(1) + df['close'].shift(1)) / 2
+        ha_open.iloc[0] = (df['open'].iloc[0] + df['close'].iloc[0]) / 2
+        ha_high = df[['high', 'open', 'close']].max(axis=1)
+        ha_low = df[['low', 'open', 'close']].min(axis=1)
+        df['ha_close'] = ha_close
+        df['ha_open'] = ha_open
+        df['ha_high'] = ha_high
+        df['ha_low'] = ha_low
+        df['ha_slope'] = ha_close.diff()
+    except Exception:
+        df['ha_slope'] = np.nan
+
+
     if df is None or len(df) < 3:
+            # Candle pattern detection
+        try:
+            df = detect_candle_patterns(df)
+        except Exception:
+            df["pattern"] = None
+
+        
         return df
 
     df = df.copy()
@@ -213,5 +377,17 @@ def compute_indicators(df):
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / ma20.replace(0, np.nan)
     except Exception:
         df['bb_upper'] = df['bb_lower'] = df['bb_width'] = np.nan
+    
+    # CHOP
+    try:
+        df['chop'] = _choppiness(df, period=14)
+    except Exception:
+        df['chop'] = np.nan
+
+    # VWAP
+    try:
+        df['vwap'] = _vwap(df)
+    except Exception:
+        df['vwap'] = np.nan
 
     return df
