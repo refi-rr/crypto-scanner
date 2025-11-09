@@ -27,6 +27,8 @@ import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+
+
 # ---- reusable chart renderer ----
 def make_chart(dfc: pd.DataFrame):
     """Reusable multi-panel chart for both mass-scan & single-scan mode."""
@@ -88,6 +90,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # ---- backend imports ----
 from scanner.scanner_core import scan
+from scanner.sentiment_binance import fetch_binance_sentiment, plot_sentiment
 from scanner.datafetch import test_ping_binance_fapi
 try:
     from scanner.history import list_signals
@@ -688,7 +691,15 @@ with tab_single:
 # TAB 3 — Sentiment
 # ===================================================
 with tab_sentiment:
-    
+
+    st.header("📊 Binance Futures Sentiment Monitor")
+    st.caption("Funding Rate, Open Interest, dan Long/Short Ratio (real-time, auto-refresh tiap 5 menit).")
+
+    for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+        data = fetch_binance_sentiment(sym)
+        plot_sentiment(sym.replace("USDT", ""), data)
+        st.markdown("---")
+
     st.header("📅 Important Chart Narrative")
         
     # HTML code untuk economic calendar
