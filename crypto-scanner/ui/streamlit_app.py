@@ -1,6 +1,6 @@
-# ui/streamlit_app.py — v4.9.0 (Tabs Edition)
+# ui/streamlit_app.py — v4.9.1 (Tabs Edition)
 """
-Crypto Futures Scanner — v4.9.0
+Crypto Futures Scanner — v4.9.1
 - Tab layout: 📊 Market Scanner & 🎯 Single Scanner
 - Reusable chart renderer (make_chart)
 - Cached scan (TTL=300s)
@@ -171,7 +171,7 @@ st.title("🚀 Crypto Futures Scanner v4.9.0")
 # ======================
 # TAB LAYOUT START
 # ======================
-tab_market, tab_single, tab_sentiment, tab_chatgpt = st.tabs(["📊 Market Scanner", "🎯 Single Scanner", "🫣 Sentiment", " 🤖 ChatGPT"])
+tab_market, tab_single, tab_sentiment = st.tabs(["📊 Market Scanner", "🎯 Single Scanner", "🫣 Sentiment"])
 
 # ===================================================
 # TAB 1 — MARKET SCANNER (original full functionality)
@@ -249,7 +249,7 @@ with tab_market:
 
                 
                 #API FnG
-
+                
                 def get_fear_greed_history(limit=30):
                     """
                     Fetch Fear & Greed Index (historical)
@@ -689,6 +689,33 @@ with tab_single:
 # ===================================================
 with tab_sentiment:
     
+    st.header("📅 Important Chart Narrative")
+        
+    # HTML code untuk economic calendar
+    narative_html = """
+    <div style="background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+        <iframe 
+            src="https://dexu.ai/narratives" 
+            width="100%" 
+            height="800" 
+            frameborder="0" 
+            allowtransparency="true" 
+            marginwidth="0" 
+            marginheight="0">
+        </iframe>
+        <div class="poweredBy" style="font-family: Arial, Helvetica, sans-serif; margin-top: 10px;">
+            <span style="font-size: 11px;color: #333333;text-decoration: none;">
+                Real Time Economic Calendar provided by 
+                <a href="https://dexu.ai/narratives" rel="nofollow" target="_blank" style="font-size: 11px;color: #06529D; font-weight: bold;" class="underline_link">Investing.com</a>.
+            </span>
+        </div>
+    </div>
+    """
+        
+    # Tampilkan HTML di Streamlit
+    st.components.v1.html(narative_html, height=1000)
+
+
     st.header("📅 Important News Sentiment - Investing.com")
         
     # HTML code untuk economic calendar
@@ -715,69 +742,4 @@ with tab_sentiment:
     # Tampilkan HTML di Streamlit
     st.components.v1.html(calendar_html, height=800)
 
-# ===================================================
-# TAB 4 — ChatGPT 5.0
-# ===================================================
-with tab_chatgpt:
-    # ---- Tab 3: GPT Analyst ----
-    st.header("🧠 GPT Analyst Playground")
-
-    st.markdown("Paste reasoning output from your scanner below. The AI will analyze and summarize the context.")
-
-    input_text = st.text_area("📋 Paste your technical reasoning here:", height=200, placeholder="[1h] EMA9<EMA21 (bear)\n[1h] Supertrend down\n...")
-
-    col1, col2 = st.columns([0.7, 0.3])
-    with col1:
-        model = st.selectbox("Model", ["gpt-4.1-mini", "gpt-4o-mini", "gpt-5-nano"], index=1)
-    with col2:
-        analyze = st.button("🔍 Analyze with GPT", use_container_width=True)
-
-    if analyze:
-        if not input_text.strip():
-            st.warning("Please paste reasoning text first.")
-            from openai import OpenAI
-            import os
-
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            if not api_key:
-                with st.sidebar:
-                    api_key = st.text_input("🔑 Enter your OpenAI API key", type="password")
-
-            if not api_key:
-                st.warning("Please provide an OpenAI API key to use GPT Analyst.")
-            else:
-                try:
-                    client = OpenAI(api_key=api_key)
-
-                    prompt = f"""
-                    You are a professional technical market analyst.
-                    Interpret the following trading reasoning and summarize the market context:
-                    {input_text}
-
-                    Provide a short summary including:
-                    - Market bias (bullish/bearish/neutral)
-                    - Strength of conviction
-                    - Risk level (low/medium/high)
-                    - Concise reasoning (2-3 sentences)
-                    """
-
-                    with st.spinner("Analyzing reasoning with GPT..."):
-                        resp = client.responses.create(model=model, input=prompt)
-
-                        # Compatible extraction (v1+ OpenAI SDK)
-                        try:
-                            output = resp.output[0].content[0].text.strip()
-                        except Exception:
-                            output = getattr(resp, "output_text", "").strip() or str(resp)
-
-                    st.success("✅ GPT Analysis Complete")
-                    st.markdown("### 💡 GPT Summary")
-                    st.write(output)
-
-                except Exception as e:
-                    st.error(f"Failed to analyze with GPT: {e}")    
-                
-
-
-st.caption("v4.9.0 — Dual Tab UI (Market + Single) with unified chart renderer")
-#client = OpenAI(api_key=os.getenv("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"))
+st.caption("v4.9.1 — Dual Tab UI (Market + Single) with unified chart renderer")
