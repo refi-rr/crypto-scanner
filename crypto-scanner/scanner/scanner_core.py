@@ -1,195 +1,374 @@
-# scanner_core.py — v4.7.7a Fix: restore return results + proper result propagation
 import asyncio
-import aiohttp
+import logging
 import time
-import random
-import os
-import json
 import zlib
 import base64
+import traceback
+from typing import Optional
+
 import pandas as pd
-import logging
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Any, Optional
-from opentelemetry.trace import Status, StatusCode
+import numpy as np
+import ccxt.async_support as ccxt
+import aiohttp
 
+from .datafetch import fetch_ohlcv_async
+from .indicators import compute_indicators
+from . import signals_v4
+
+# ===== TRACING FIX =====
 from scanner.tracing_setup import init_tracer
-tracer = init_tracer("crypto-scanner")
-
-from scanner.datafetch import (
-    create_exchange,
-    fetch_top_symbols_binance_futures,
-    fetch_top_symbols_bybit_futures,
+tracer = init_tracer(
+    service_name="crypto-scanner",
+    agent_host="172.24.0.2",
+    agent_port=6831
 )
-from scanner.indicators import compute_indicators
-from scanner import signals_v4
 
-try:
-    from scanner.history import init_db, log_signal
-    init_db()
-except Exception:
-    def log_signal(x): pass
+from opentelemetry.trace import Status, StatusCode
+from opentelemetry.context import attach, detach, get_current
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-DEFAULT_CONCURRENCY = 15
-MAX_CONCURRENCY = 30
-MIN_CONCURRENCY = 2
-_THREAD_POOL = ThreadPoolExecutor(max_workers=14)
 
-BINANCE_KLINES_URLS = [
-    "https://fapi.binance.com/fapi/v1/klines",
-    "https://data-api.binance.vision/api/v3/klines",
-    "https://futures.binance.com/fapi/v1/klines",
-]
+# ============================================================
+# FETCH SYMBOLS (RELIABLE TOP-N FROM BINANCE/BYBIT REST API)
+# ============================================================
 
-RETRY_COUNT = 3
-RETRY_BACKOFF_BASE = 0.5
+async def fetch_binance_futures_symbols():
+    """
+    Fetch list USDT futures perpetual from Binance Futures API.
+    More reliable than ccxt.load_markets().
+    """
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=10) as r:
+                js = await r.json()
 
-def normalize_symbol_for_binance(sym: str) -> str:
-    s = str(sym).split(":")[0].replace("/", "").upper()
-    if not s.endswith("USDT"):
-        s = f"{s}USDT"
-    return s
+        symbols = []
+        for sym in js["symbols"]:
+            if sym.get("contractType") == "PERPETUAL" and sym.get("quoteAsset") == "USDT":
+                symbols.append(sym["symbol"].replace("USDT", "/USDT"))
 
-def ohlcv_to_df(ohlcv: List[List[Any]]) -> pd.DataFrame:
-    df = pd.DataFrame(ohlcv)
-    if df.shape[1] >= 6:
-        df = df.iloc[:, :6]
-        df.columns = ["ts", "open", "high", "low", "close", "volume"]
-    df["datetime"] = pd.to_datetime(df["ts"], unit="ms")
-    df.set_index("datetime", inplace=True)
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+        return symbols
 
-# async helpers
-async def fetch_http_with_retries(session: aiohttp.ClientSession, url: str, params: dict):
-    for attempt in range(1, RETRY_COUNT + 1):
+    except Exception as e:
+        logger.error(f"[fetch_binance_futures_symbols] ERROR: {e}")
+        logger.error(traceback.format_exc())
+        return []
+
+
+async def fetch_bybit_futures_symbols():
+    """
+    Fetch list USDT linear perpetual from Bybit API.
+    """
+    url = "https://api.bybit.com/v5/market/instruments-info?category=linear"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=10) as r:
+                js = await r.json()
+
+        arr = js.get("result", {}).get("list", [])
+        symbols = []
+        for d in arr:
+            if d.get("quoteCoin") == "USDT":
+                symbols.append(d["symbol"].replace("USDT", "/USDT"))
+
+        return symbols
+
+    except Exception as e:
+        logger.error(f"[fetch_bybit_futures_symbols] ERROR: {e}")
+        logger.error(traceback.format_exc())
+        return []
+
+
+# ============================================================
+# COMPRESS OHLCV
+# ============================================================
+
+def compress_ohlcv(df: Optional[pd.DataFrame]) -> str:
+    if df is None or df.empty:
+        return ""
+    try:
+        df2 = df.copy()
+        if df2.index.name is not None:
+            df2 = df2.reset_index()
+        js = df2.to_json(orient="split", date_format="iso")
+        comp = zlib.compress(js.encode("utf-8"))
+        return base64.b64encode(comp).decode("ascii")
+    except Exception:
+        return ""
+
+
+# ============================================================
+# MULTI TIMEFRAME BUILDER
+# ============================================================
+
+async def build_mtf_dfs_async(exchange, symbol, mtf, limit_ohlcv=500, delay=0.15):
+    dfs = {}
+    for tf in mtf:
         try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"HTTP {resp.status}")
-                return await resp.json()
-        except Exception:
-            if attempt < RETRY_COUNT:
-                await asyncio.sleep(RETRY_BACKOFF_BASE * 2 ** (attempt - 1))
-            else:
-                raise
+            df = await fetch_ohlcv_async(exchange, symbol, tf, limit_ohlcv)
+            if df is None or df.empty:
+                dfs[tf] = None
+                await asyncio.sleep(delay)
+                continue
 
-async def fetch_symbol_klines(symbol: str, tf: str, limit: int, session: aiohttp.ClientSession):
-    params = {"symbol": normalize_symbol_for_binance(symbol), "interval": tf, "limit": limit}
-    for url in BINANCE_KLINES_URLS:
-        try:
-            return await fetch_http_with_retries(session, url, params)
-        except Exception:
-            await asyncio.sleep(random.uniform(0.05, 0.2))
-    return None
+            df = compute_indicators(df)
+            dfs[tf] = df
+            await asyncio.sleep(delay)
 
-async def fetch_ohlcv_for_symbol(exchange_name, exchange_obj, symbol, timeframe, limit, aiohttp_session):
-    with tracer.start_as_current_span("fetch_ohlcv_single") as span:
-        span.set_attribute("symbol", symbol)
-        span.set_attribute("exchange", exchange_name)
-        span.set_attribute("timeframe", timeframe)
-        try:
-            if exchange_name == "binance" and aiohttp_session:
-                res = await fetch_symbol_klines(symbol, timeframe, limit, aiohttp_session)
-                span.set_status(Status(StatusCode.OK))
-                return res
-            func = exchange_obj.fetch_ohlcv
-            result = await asyncio.get_event_loop().run_in_executor(_THREAD_POOL, lambda: func(symbol, timeframe, limit))
-            span.set_status(Status(StatusCode.OK))
-            return result
         except Exception as e:
-            span.record_exception(e)
-            span.set_status(Status(StatusCode.ERROR))
+            logger.warning(f"[MTF] {symbol} {tf} failed: {e}")
+            dfs[tf] = None
+    return dfs
+
+
+# ============================================================
+# TRADE PLAN GENERATOR
+# ============================================================
+
+def _compute_trade_plan_from_df(df: pd.DataFrame, signal: str):
+    try:
+        if df is None or df.empty:
             return None
 
-async def build_mtf_dfs_async(exchange_name, exchange_obj, symbol, timeframes, limit, aiohttp_session, delay_between_requests):
-    with tracer.start_as_current_span("build_mtf_dfs") as span:
-        dfs = {}
-        span.set_attribute("symbol", symbol)
-        for tf in timeframes:
-            res = await fetch_ohlcv_for_symbol(exchange_name, exchange_obj, symbol, tf, limit, aiohttp_session)
-            if not res:
-                dfs[tf] = None
-                continue
-            try:
-                df = ohlcv_to_df(res)
-                df = compute_indicators(df)
-                df["support"] = df["low"].rolling(20).min()
-                df["resistance"] = df["high"].rolling(20).max()
-                dfs[tf] = df
-            except Exception as e:
-                span.record_exception(e)
-                dfs[tf] = None
-            await asyncio.sleep(delay_between_requests)
-        span.set_status(Status(StatusCode.OK))
-        return dfs
+        last = df.iloc[-1]
+        last_close = float(last.get("close", np.nan))
+        if np.isnan(last_close):
+            return None
 
-def scan(exchange_name="binance", top_n=25, timeframe="1h", limit_ohlcv=500, delay_between_requests=0.15, mtf=None):
-    with tracer.start_as_current_span("scan_total") as span:
-        span.set_attribute("exchange", exchange_name)
-        span.set_attribute("timeframe", timeframe)
-        span.set_attribute("coins_limit", top_n)
-        try:
-            start_time = time.time()
-            ex = create_exchange(exchange_name)
-            mtf = mtf or [timeframe]
+        win = min(50, max(5, int(len(df) / 4)))
+        support = float(df["low"].rolling(win, min_periods=1).min().iloc[-1])
+        resistance = float(df["high"].rolling(win, min_periods=1).max().iloc[-1])
 
-            # symbols
-            with tracer.start_as_current_span("fetch_symbols") as sspan:
-                if exchange_name == "binance":
-                    symbols = fetch_top_symbols_binance_futures(ex, limit=top_n)
-                else:
-                    symbols = fetch_top_symbols_bybit_futures(ex, limit=top_n)
-                sspan.set_attribute("symbols_count", len(symbols))
+        atr = float(df["close"].diff().abs().rolling(14, min_periods=1).mean().iloc[-1])
+        if np.isnan(atr) or atr <= 0:
+            atr = max(
+                (resistance - support) * 0.02 if (resistance > support) else last_close * 0.01,
+                1e-6
+            )
 
-            if not symbols:
-                span.set_status(Status(StatusCode.ERROR))
-                return {"results": [], "metrics": {}}
+        entry = last_close
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        if signal == "LONG":
+            sl = entry - 1.5 * atr
+            tp1 = entry + 1.0 * atr
+            tp2 = entry + 3.0 * atr
+        elif signal == "SHORT":
+            sl = entry + 1.5 * atr
+            tp1 = entry - 1.0 * atr
+            tp2 = entry - 3.0 * atr
+        else:
+            return {
+                "entry": None, "tp1": None, "tp2": None, "sl": None,
+                "support": support, "resistance": resistance
+            }
 
-            async def _run():
-                results = []
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-                    sem = asyncio.Semaphore(10)
-                    async def handle_symbol(sym):
-                        with tracer.start_as_current_span("process_symbol") as sspan:
-                            sspan.set_attribute("symbol", sym)
-                            try:
-                                async with sem:
-                                    dfs = await build_mtf_dfs_async(exchange_name, ex, sym, mtf, limit_ohlcv, session, delay_between_requests)
-                                    sig = signals_v4.evaluate_signals_mtf(dfs)
-                                    res = {
-                                        "symbol": sym,
-                                        "signal": sig.get("signal"),
-                                        "confidence": sig.get("confidence", 0),
-                                        "reasons": sig.get("reasons", []),
-                                    }
-                                    sspan.set_status(Status(StatusCode.OK))
-                                    return res
-                            except Exception as e:
-                                sspan.record_exception(e)
-                                sspan.set_status(Status(StatusCode.ERROR))
-                                return {"symbol": sym, "error": str(e)}
-                    tasks = [asyncio.create_task(handle_symbol(s)) for s in symbols]
-                    done = await asyncio.gather(*tasks, return_exceptions=True)
-                    for d in done:
-                        if isinstance(d, dict):
-                            results.append(d)
-                return results
+        if signal == "LONG":
+            tp1 = min(tp1, resistance - atr * 0.1)
+            tp2 = min(tp2, resistance)
+            sl = max(sl, support - atr * 0.2)
+        elif signal == "SHORT":
+            tp1 = max(tp1, support + atr * 0.1)
+            tp2 = max(tp2, support)
+            sl = min(sl, resistance + atr * 0.2)
 
-            results = loop.run_until_complete(_run())
-            duration = round(time.time() - start_time, 2)
-            span.set_status(Status(StatusCode.OK))
-            span.set_attribute("duration_sec", duration)
-            return {"results": results, "metrics": {"duration_sec": duration, "count": len(results)}}
+        def _r(v):
+            try: return float(round(v, 8))
+            except: return None
 
-        except Exception as e:
-            span.record_exception(e)
-            span.set_status(Status(StatusCode.ERROR))
-            return {"results": [{"error": str(e)}], "metrics": {}}
+        return {
+            "entry": _r(entry),
+            "tp1": _r(tp1),
+            "tp2": _r(tp2),
+            "sl": _r(sl),
+            "support": _r(support),
+            "resistance": _r(resistance)
+        }
+
+    except Exception as e:
+        logger.debug(f"Trade plan compute error: {e}")
+        return None
+
+
+# ============================================================
+# MAIN SCANNER
+# ============================================================
+
+async def scan_async(exchange_name="binance", top_n=50, timeframe="1h",
+                     limit_ohlcv=500, delay_between_requests=0.15,
+                     mtf=None, concurrency=10):
+
+    if mtf is None:
+        mtf = [timeframe, "4h", "1d"]
+
+    logger.info(f"🔍 Starting scan on {exchange_name.upper()} ({top_n} symbols) ...")
+    t0 = time.time()
+
+    # -------------------------------
+    # 1. Get list of top symbols
+    # -------------------------------
+    try:
+        if exchange_name.lower() == "binance":
+            symbols_all = await fetch_binance_futures_symbols()
+
+        elif exchange_name.lower() == "bybit":
+            symbols_all = await fetch_bybit_futures_symbols()
+
+        else:
+            raise ValueError("Unsupported exchange")
+
+        if not symbols_all:
+            raise RuntimeError("Symbol list is empty")
+
+        symbols = symbols_all[:top_n]
+
+    except Exception as e:
+        logger.error(f"[symbol_fetch] FAILED: {e}")
+        fallback = ["BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","ADA/USDT",
+                    "XRP/USDT","DOGE/USDT","DOT/USDT","LINK/USDT","LTC/USDT"]
+        symbols = fallback[:top_n]
+
+    # -------------------------------
+    # 2. Create exchange for OHLCV
+    # -------------------------------
+    try:
+        if exchange_name.lower() == "binance":
+            exchange = ccxt.binance({
+                "options": {"defaultType": "future"},
+                "enableRateLimit": True
+            })
+        elif exchange_name.lower() == "bybit":
+            exchange = ccxt.bybit({"enableRateLimit": True})
+    except Exception as e:
+        logger.error(f"Failed to create exchange {exchange_name}: {e}")
+        return {"results": [], "metrics": {"error": str(e)}}
+
+    sem = asyncio.Semaphore(concurrency)
+    results = []
+    current_ctx = get_current()
+
+    # -------------------------------
+    # 3. Process per symbol
+    # -------------------------------
+    async def process_symbol(sym):
+        async with sem:
+            with tracer.start_as_current_span(f"scan_symbol_{sym}") as span:
+                span.set_attribute("symbol", sym)
+
+                try:
+                    dfs = await build_mtf_dfs_async(
+                        exchange, sym, mtf, limit_ohlcv, delay_between_requests
+                    )
+
+                    span.set_attribute("mtf_loaded", str(list(dfs.keys())))
+
+                    primary_df = None
+                    for tf in mtf:
+                        dfcand = dfs.get(tf)
+                        if dfcand is not None and not dfcand.empty:
+                            primary_df = dfcand
+                            break
+
+                    if primary_df is None:
+                        span.set_status(Status(StatusCode.ERROR, "no_valid_data"))
+                        results.append({
+                            "symbol": sym, "signal": "NEUTRAL", "confidence": 0,
+                            "entry": None, "tp1": None, "tp2": None, "sl": None,
+                            "support": None, "resistance": None,
+                            "reasons": ["no_valid_data"],
+                            "meta": {}, "ohlcv_z": ""
+                        })
+                        return
+
+                    sig = signals_v4.evaluate_signals_mtf(dfs)
+                    span.set_attribute("signal", sig.get("signal"))
+                    span.set_attribute("confidence", sig.get("confidence"))
+
+                    final_signal = sig.get("signal", "NEUTRAL")
+                    confidence = sig.get("confidence", 0)
+
+                    if confidence == 0 and final_signal != "NEUTRAL":
+                        confidence = 40.0
+
+                    trade_plan = _compute_trade_plan_from_df(primary_df, final_signal)
+                    ohlcv_z = compress_ohlcv(primary_df)
+
+                    res = {
+                        "symbol": sym,
+                        "signal": final_signal,
+                        "confidence": float(confidence),
+                        "reasons": sig.get("reasons"),
+                        "meta": sig.get("meta"),
+                        "ohlcv_z": ohlcv_z,
+                    }
+
+                    if trade_plan:
+                        res.update(trade_plan)
+                    else:
+                        res.update({
+                            "entry": None, "tp1": None, "tp2": None, "sl": None,
+                            "support": None, "resistance": None,
+                        })
+
+                    results.append(res)
+                    span.set_status(Status(StatusCode.OK))
+
+                except Exception as e:
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                    results.append({
+                        "symbol": sym,
+                        "signal": "NEUTRAL",
+                        "confidence": 0,
+                        "entry": None, "tp1": None, "tp2": None, "sl": None,
+                        "support": None, "resistance": None,
+                        "reasons": [str(e)],
+                        "meta": {}, "ohlcv_z": ""
+                    })
+
+    await asyncio.gather(*[process_symbol(s) for s in symbols])
+
+    await exchange.close()
+    t1 = time.time()
+
+    return {
+        "results": results,
+        "metrics": {
+            "exchange": exchange_name,
+            "total": len(symbols),
+            "success": len(results),
+            "total_sec": round(t1 - t0, 2),
+            "avg_latency": round((t1 - t0) / max(len(symbols), 1), 3),
+            "concurrency": concurrency,
+        }
+    }
+
+
+# ============================================================
+# SYNC WRAPPER
+# ============================================================
+
+def scan(exchange, top_n=50, timeframe="1h",
+         limit_ohlcv=500, delay_between_requests=0.15, mtf=None):
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    try:
+        return loop.run_until_complete(
+            scan_async(
+                exchange_name=exchange,
+                top_n=top_n,
+                timeframe=timeframe,
+                limit_ohlcv=limit_ohlcv,
+                delay_between_requests=delay_between_requests,
+                mtf=mtf,
+            )
+        )
+    except Exception as e:
+        logger.error(f"scan() failed: {e}")
+        return {"results": [], "metrics": {"error": str(e)}}
