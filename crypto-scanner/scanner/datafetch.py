@@ -1,231 +1,159 @@
-# scanner/datafetch.py
-"""
-datafetch v4.6 — Complete export surface
-- Exports: create_exchange, test_ping_binance_fapi, test_ping_bybit,
-  fetch_top_symbols_binance_futures, fetch_top_symbols_bybit_futures
-- Uses direct HTTP fallback to Binance Vision if ccxt.load_markets fails
-- Does NOT call load_markets in create_exchange to avoid forcing exchangeInfo on init
-"""
-
+import asyncio
+import aiohttp
+import pandas as pd
 import logging
-import time
-import requests
-import ccxt
-from ccxt.base.errors import RequestTimeout, NetworkError, ExchangeNotAvailable
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-
-# ------------------------
-# Exchange factory
-# ------------------------
-def create_exchange(name: str, timeout_ms: int = 20000):
+def create_exchange(exchange_name: str = "binance"):
     """
-    Create CCXT exchange instance without forcing load_markets().
-    For Binance: force futures base URL so ccxt won't hit api.binance.com.
+    Factory function to create a ccxt exchange instance with proper configuration.
+    Supports 'binance' and 'bybit' (default: binance futures).
     """
-    name = name.lower()
     try:
-        if name == "binance":
+        exchange_name = exchange_name.lower().strip()
+
+        if exchange_name == "binance":
             ex = ccxt.binance({
                 "enableRateLimit": True,
-                "options": {"defaultType": "future", "adjustForTimeDifference": True},
-                "urls": {
-                    "api": {
-                        "public": "https://fapi.binance.com/fapi/v1",
-                        "private": "https://fapi.binance.com/fapi/v1",
-                    }
-                },
-                "timeout": timeout_ms,
+                "timeout": 10000,
+                "options": {"defaultType": "future"}
             })
-            logger.info("Created ccxt.binance instance (fapi forced).")
-            return ex
-
-        elif name == "bybit":
+        elif exchange_name == "bybit":
             ex = ccxt.bybit({
                 "enableRateLimit": True,
-                "options": {"defaultType": "future", "adjustForTimeDifference": True},
-                "timeout": timeout_ms,
+                "timeout": 10000,
+                "options": {"defaultType": "swap"}
             })
-            logger.info("Created ccxt.bybit instance.")
-            return ex
-
         else:
-            raise ValueError(f"Exchange '{name}' not supported")
+            raise ValueError(f"Unsupported exchange: {exchange_name}")
+
+        logger.info(f"[create_exchange] Created ccxt.{exchange_name} instance")
+        return ex
 
     except Exception as e:
-        logger.error(f"Failed to create exchange {name}: {e}")
-        raise
+        logger.error(f"Failed to create exchange {exchange_name}: {e}")
+        return None
+
+async def fetch_ohlcv_async(exchange, symbol, timeframe="1h", limit=500):
+    """
+    Async-safe OHLCV fetch with multi-endpoint fallback (Binance Futures + Vision).
+    Returns DataFrame or empty if all fail.
+    """
+    async def _via_ccxt():
+        try:
+            data = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if data:
+                df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+                df = df.drop(columns=["timestamp"])
+                return df
+        except Exception as e:
+            logger.debug(f"[ccxt_fetch_fail] {symbol} {timeframe}: {e}")
+        return pd.DataFrame()
+
+    async def _via_http():
+        try:
+            sym = symbol.replace("/", "")
+            url = f"https://data-api.binance.vision/api/v3/klines?symbol={sym}&interval={timeframe}&limit={limit}"
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(url, timeout=8) as r:
+                    if r.status == 200:
+                        js = await r.json()
+                        if not js:
+                            return pd.DataFrame()
+                        df = pd.DataFrame(js, columns=[
+                            "timestamp","open","high","low","close","volume",
+                            "_1","_2","_3","_4","_5","_6"
+                        ])
+                        df = df[["timestamp","open","high","low","close","volume"]]
+                        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+                        df = df.drop(columns=["timestamp"])
+                        return df
+        except Exception as e:
+            logger.debug(f"[http_fallback_fail] {symbol} {timeframe}: {e}")
+        return pd.DataFrame()
+
+    # ---- execution ----
+    df = await _via_ccxt()
+    if df.empty:
+        df = await _via_http()
+
+    if df.empty:
+        logger.warning(f"[fetch_ohlcv_async] No data for {symbol} ({timeframe})")
+    return df
+
+def fetch_top_symbols_binance_futures(exchange=None, limit: int = 100):
+    """
+    Fetch top perpetual symbols from Binance Futures (USDT-margined contracts).
+    'exchange' arg is ignored, kept only for backward compatibility.
+    """
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    try:
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        js = resp.json()
+        symbols = []
+
+        for s in js.get("symbols", []):
+            if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+                sym = s.get("symbol")
+                if sym.endswith("USDT"):
+                    symbols.append(sym.replace("USDT", "/USDT"))
+
+        symbols = sorted(symbols, key=lambda x: (not x.startswith("BTC/"), not x.startswith("ETH/"), x))
+        return symbols[:limit]
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch top symbols from Binance Futures: {e}")
+        return []
+
+def fetch_top_symbols_bybit_futures(limit: int = 100):
+    """
+    Fetch top USDT perpetual trading pairs from Bybit.
+    Returns a list of symbols like ['BTC/USDT', 'ETH/USDT', ...].
+    """
+    url = "https://api.bybit.com/v5/market/instruments-info?category=linear"
+    try:
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        js = resp.json()
+        symbols = []
+
+        for item in js.get("result", {}).get("list", []):
+            if (
+                item.get("quoteCoin") == "USDT"
+                and item.get("status") == "Trading"
+                and "symbol" in item
+            ):
+                s = item["symbol"]
+                if s.endswith("USDT"):
+                    # Normalize to match ccxt style, e.g., BTCUSDT -> BTC/USDT
+                    symbols.append(s.replace("USDT", "/USDT"))
+
+        # Sort alphabetically with BTC and ETH first
+        symbols = sorted(symbols, key=lambda x: (not x.startswith("BTC/"), not x.startswith("ETH/"), x))
+        return symbols[:limit]
+
+    except Exception as e:
+        logger.warning(f"Failed to fetch top symbols from Bybit Futures: {e}")
+        return []
 
 
-# ------------------------
-# Ping helpers
-# ------------------------
-def test_ping_binance_fapi(timeout: float = 5.0) -> bool:
-    """Lightweight ping to Binance Futures (fapi.binance.com)."""
+def test_ping_binance_fapi(timeout=5):
+    """
+    Quick connectivity test to Binance Futures (FAPI) endpoint.
+    Returns True if reachable, False otherwise.
+    """
     url = "https://fapi.binance.com/fapi/v1/ping"
     try:
-        r = requests.get(url, timeout=timeout)
-        ok = (r.status_code == 200)
-        if not ok:
-            logger.warning(f"Binance FAPI ping returned {r.status_code}")
-        return ok
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            logger.info("✅ Binance FAPI reachable")
+            return True
+        else:
+            logger.warning(f"⚠️ Binance FAPI ping failed: {resp.status_code}")
+            return False
     except Exception as e:
         logger.warning(f"Binance FAPI ping failed: {e}")
         return False
-
-
-def test_ping_bybit(timeout: float = 5.0):
-    """Ping Bybit public endpoint; returns (ok: bool, latency_ms: float|None)."""
-    url = "https://api.bybit.com/v5/market/time"
-    try:
-        start = time.time()
-        r = requests.get(url, timeout=timeout)
-        latency = round((time.time() - start) * 1000, 1)
-        ok = (r.status_code == 200)
-        if not ok:
-            logger.warning(f"Bybit ping returned {r.status_code}")
-        return ok, latency
-    except Exception as e:
-        logger.warning(f"Bybit ping failed: {e}")
-        return False, None
-
-
-# ------------------------
-# Internal helper: direct HTTP fetch of exchangeInfo (fallback)
-# ------------------------
-def _fetch_markets_fapi_requests(timeout=8):
-    """
-    Try direct HTTP requests to Binance FAPI / Vision to collect symbols.
-    Returns list of normalized symbols like 'BTC/USDT'.
-    """
-    urls = [
-        "https://fapi.binance.com/fapi/v1/exchangeInfo",
-        "https://data-api.binance.vision/api/v3/exchangeInfo",
-    ]
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=timeout)
-            if r.status_code != 200:
-                logger.warning(f"Fallback {url} returned {r.status_code}")
-                continue
-            payload = r.json()
-            syms = []
-            for s in payload.get("symbols", []):
-                if s.get("quoteAsset") != "USDT":
-                    continue
-                if s.get("status") != "TRADING":
-                    continue
-                symbol = s.get("symbol")
-                # Normalize to CCXT-like 'BASE/QUOTE'
-                if "/" not in symbol:
-                    if symbol.endswith("USDT"):
-                        base = symbol[:-4]
-                        norm = f"{base}/USDT"
-                    else:
-                        norm = symbol
-                else:
-                    norm = symbol
-                # Filter perpetuals preferentially if contractType present
-                contract_type = s.get("contractType") or s.get("contract_type") or None
-                if contract_type:
-                    if str(contract_type).upper() == "PERPETUAL":
-                        syms.append(norm)
-                else:
-                    # if no contract type info (vision might not include), accept it
-                    syms.append(norm)
-            # de-duplicate preserving order
-            uniq = []
-            for x in syms:
-                if x not in uniq:
-                    uniq.append(x)
-            logger.info(f"Fetched {len(uniq)} symbols from fallback {url}")
-            return uniq
-        except Exception as e:
-            logger.warning(f"Fallback fetch {url} failed: {e}")
-            continue
-    return []
-
-
-# ------------------------
-# Symbol fetchers (Binance + Bybit)
-# ------------------------
-def fetch_top_symbols_binance_futures(exchange, limit=100, try_ccxt=True):
-    """
-    Fetch top Binance USDT PERPETUAL symbols safely.
-    - try_ccxt: attempt exchange.load_markets() once; if fails, fallback to HTTP
-    """
-    symbols = []
-    if try_ccxt:
-        try:
-            logger.info("Attempting exchange.load_markets() via ccxt (Binance)...")
-            # Avoid forced full reload; let ccxt decide caching
-            markets = exchange.load_markets(reload=False)
-            for s, m in markets.items():
-                try:
-                    # filter for USDT perpetual futures
-                    info = m.get("info", {}) or {}
-                    mtype = m.get("type")
-                    if "USDT" in s and "BUSD" not in s:
-                        if (mtype == "future") or (str(info.get("contractType", "")).upper() == "PERPETUAL"):
-                            symbols.append(s)
-                except Exception:
-                    continue
-            if symbols:
-                logger.info(f"ccxt.load_markets found {len(symbols)} perpetual symbols.")
-                return symbols[:limit]
-            else:
-                logger.warning("ccxt.load_markets returned no perpetuals; will fallback.")
-        except (RequestTimeout, NetworkError, ExchangeNotAvailable) as e:
-            logger.warning(f"ccxt.load_markets failed for Binance: {e}")
-        except Exception as e:
-            logger.warning(f"Unexpected ccxt.load_markets error (Binance): {e}")
-
-    # Fallback to direct HTTP
-    logger.info("Falling back to direct HTTP to fetch Binance symbols (FAPI/Vision).")
-    try_syms = _fetch_markets_fapi_requests()
-    if try_syms:
-        return try_syms[:limit]
-    logger.error("Failed to obtain Binance symbols via both ccxt and HTTP fallback.")
-    return []
-
-
-def fetch_top_symbols_bybit_futures(exchange, limit=100):
-    """
-    Fetch top Bybit USDT perpetual symbols.
-    Use ccxt.load_markets ideally. No HTTP fallback provided (Bybit has different API).
-    """
-    symbols = []
-    try:
-        logger.info("Loading Bybit markets via ccxt...")
-        markets = exchange.load_markets(reload=False)
-        for s, m in markets.items():
-            try:
-                if "USDT" in s:
-                    mtype = m.get("type")
-                    # Some bybit markets have id like 'BTCUSDT' and info may include 'symbol'
-                    info = m.get("info", {}) or {}
-                    # try to detect perpetual via id or info fields
-                    mid = str(m.get("id") or info.get("symbol") or "").upper()
-                    if (mtype in ("linear", "future")) or ("PERP" in mid or "PERPETUAL" in mid):
-                        symbols.append(s)
-            except Exception:
-                continue
-        if symbols:
-            logger.info(f"Found {len(symbols)} Bybit perpetual symbols.")
-            return symbols[:limit]
-        else:
-            logger.warning("No Bybit perpetual symbols found via ccxt.load_markets.")
-            return []
-    except (RequestTimeout, NetworkError, ExchangeNotAvailable) as e:
-        logger.warning(f"Bybit load_markets failed: {e}")
-        return []
-    except Exception as e:
-        logger.warning(f"Unexpected Bybit fetch error: {e}")
-        return []
-
-
-# ------------------------
-# End of datafetch.py
-# ------------------------
