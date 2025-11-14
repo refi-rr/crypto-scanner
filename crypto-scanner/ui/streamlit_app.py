@@ -1,6 +1,6 @@
-# ui/streamlit_app.py — v4.9.1 (Tabs Edition)
+# ui/streamlit_app.py — v4.9.2 (Tabs Edition)
 """
-Crypto Futures Scanner — v4.9.1
+Crypto Futures Scanner — v4.9.2
 - Tab layout: 📊 Market Scanner & 🎯 Single Scanner
 - Reusable chart renderer (make_chart)
 - Cached scan (TTL=300s)
@@ -20,12 +20,15 @@ import base64
 import math
 import pytz
 import requests
+import sqlite3
 from pathlib import Path
 import pandas as pd
 from datetime import datetime
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly.subplots import make_subplots
+
 
 
 
@@ -92,6 +95,19 @@ if str(PROJECT_ROOT) not in sys.path:
 from scanner.scanner_core import scan
 from scanner.sentiment_binance import fetch_binance_sentiment, plot_sentiment
 from scanner.datafetch import test_ping_binance_fapi
+from scanner.ai_chat import render_chat_tab
+from scanner.resource_monitor import DB_METRIC, init_perf_db
+from scanner.tracing_setup import init_tracer
+import asyncio
+import ccxt.async_support as ccxt
+
+from scanner.scanner_core import (
+    build_mtf_dfs_async,
+    compress_ohlcv,
+    _compute_trade_plan_from_df,
+)
+from scanner import signals_v4
+
 try:
     from scanner.history import list_signals
 except Exception:
@@ -174,7 +190,7 @@ st.title("🚀 Crypto Futures Scanner v4.9.0")
 # ======================
 # TAB LAYOUT START
 # ======================
-tab_market, tab_single, tab_sentiment = st.tabs(["📊 Market Scanner", "🎯 Single Scanner", "🫣 Sentiment"])
+tab_market, tab_single, tab_sentiment, tab_ai, tab_resource = st.tabs(["📊 Market Scanner", "🎯 Single Scanner", "🫣 Sentiment", "🤖 AI (BETA)", "⚙️ Resource Monitor"])
 
 # ===================================================
 # TAB 1 — MARKET SCANNER (original full functionality)
@@ -595,97 +611,205 @@ with tab_market:
 # ===================================================
 # TAB 2 — SINGLE SCANNER
 # ===================================================
+# ==========================================================
+# TAB 2 — SINGLE PAIR SCANNER (FINAL FIXED VERSION)
+# ==========================================================
 with tab_single:
-    st.markdown("## 🎯 Single Pair Scanner")
+    st.header("🎯 Single Pair Scanner")
 
-    from scanner.datafetch import (
-        create_exchange,
-        fetch_top_symbols_binance_futures,
-        fetch_top_symbols_bybit_futures
-    )
+    # ------------------------------------------------------
+    # load symbols (cached)
+    # ------------------------------------------------------
+    @st.cache_data(ttl=900)
+    def load_symbols(exchange_name):
+        try:
+            if exchange_name == "binance":
+                return asyncio.run(fetch_binance_futures_symbols())
+            elif exchange_name == "bybit":
+                return asyncio.run(fetch_bybit_futures_symbols())
+        except:
+            pass
+        return []
 
-    colA, colB = st.columns(2)
-    with colA:
-        exchange_single = st.selectbox("Exchange", ["binance", "bybit"], key="single_exchange")
-    with colB:
-        mtf_single = st.multiselect(
-            "Multi-timeframe (primary first)",
-            ["15m","1h","4h","1d"],
-            default=["1h","4h","1d"],
-            key="single_mtf"
+    # ------------------------------------------------------
+    # exchange select
+    # ------------------------------------------------------
+    exchange_single = st.selectbox("Exchange", ["binance", "bybit"], key="single_exch")
+
+    # ------------------------------------------------------
+    # symbol list
+    # ------------------------------------------------------
+    symbol_list = load_symbols(exchange_single)
+    symbol_list = sorted(symbol_list)
+
+    colL, colR = st.columns([0.6, 0.4])
+
+    with colL:
+        symbol_dropdown = st.selectbox(
+            "Select Pair (from exchange)",
+            symbol_list if symbol_list else ["BTC/USDT"],
+            index=0,
+            key="single_symbol_dropdown"
         )
 
-    @st.cache_data(ttl=600)
-    def load_symbols(exchange):
-        ex = create_exchange(exchange)
-        if exchange == "binance":
-            return fetch_top_symbols_binance_futures(ex, limit=200)
-        else:
-            return fetch_top_symbols_bybit_futures(ex, limit=200)
+    with colR:
+        manual_input = st.text_input(
+            "Or type manually (e.g. ASTER / ASTERUSDT / ASTER/USDT)",
+            key="single_symbol_manual"
+        )
 
-    symbols_single = load_symbols(exchange_single)
-    symbol_single = st.selectbox("Select Pair", symbols_single, key="single_symbol")
-    candles_single = st.slider("Candles", 200, 1200, 500, step=50, key="single_candles")
+    # ------------------------------------------------------
+    # normalized symbol
+    # ------------------------------------------------------
+    def normalize_symbol(s: str) -> str:
+        if not s:
+            return ""
+        s = s.strip().upper().replace(" ", "")
 
-    # --- Run Scan ---
-    if st.button("🚀 Run Single Scan", use_container_width=True):
-        with st.spinner(f"Scanning {symbol_single} on {exchange_single} ..."):
-            primary_tf = mtf_single[0] if mtf_single else "1h"
-            # --- Run dedicated single symbol scan ---
-            from scanner.scanner_core import build_mtf_dfs_async, create_exchange
-            import asyncio, aiohttp
-            from scanner import signals_v4
+        # ASTERUSDT -> ASTER/USDT
+        if s.endswith("USDT") and "/" not in s:
+            return f"{s[:-4]}/USDT"
 
-            async def run_single_symbol(exchange_name, symbol, mtf, limit):
-                ex = create_exchange(exchange_name)
-                timeout = aiohttp.ClientTimeout(total=40)
-                conn = aiohttp.TCPConnector(limit_per_host=10)
-                async with aiohttp.ClientSession(connector=conn, timeout=timeout) as session:
-                    dfs = await build_mtf_dfs_async(exchange_name, ex, symbol, mtf, limit, session, delay_between_requests=0.15)
-                sig = signals_v4.evaluate_signals_mtf(dfs)
-                base_df = dfs.get(mtf[0])
-                ohlcv_z = None
-                if base_df is not None and not base_df.empty:
-                    import zlib, base64
-                    tmp = base_df.tail(400).reset_index().copy()
-                    ohlcv_z = base64.b64encode(zlib.compress(tmp.to_json(orient="split", date_format="iso").encode())).decode()
-                return {"symbol": symbol, "signal": sig.get("signal"), "confidence": sig.get("confidence"),
-                        "reasons": sig.get("reasons"), "meta": sig.get("meta"),
-                        "entry": float(base_df.iloc[-1]["close"]) if base_df is not None else None,
-                        "ohlcv_z": ohlcv_z}
+        # ASTER/USDT (keep)
+        if "/" in s:
+            base, quote = s.split("/", 1)
+            quote = quote or "USDT"
+            return f"{base}/USDT"
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            res = loop.run_until_complete(run_single_symbol(exchange_single, symbol_single, mtf_single, candles_single))
-            st.session_state["single_result"] = res
-            st.success("✅ Single scan complete")
+        # ASTER -> ASTER/USDT
+        return f"{s}/USDT"
 
+    chosen = manual_input.strip() if manual_input.strip() else symbol_dropdown
+    final_symbol = normalize_symbol(chosen)
 
-    # --- Show Result ---
-    res = st.session_state.get("single_result")
-    if res:
-        st.markdown(f"### {res.get('symbol','?')} — {res.get('signal','?')} ({round(float(res.get('confidence',0)),1)}%)")
+    st.write(f"**Symbol selected:** `{final_symbol}`")
 
-        colL, colR = st.columns([0.55, 0.45])
-        with colL:
-            st.markdown("#### 🧠 Signal Breakdown")
-            st.json(res.get("reasons") or {"info":"No reasoning available"})
+    # ------------------------------------------------------
+    # multi-timeframe
+    # ------------------------------------------------------
+    mtf_single = st.multiselect(
+        "Multi-timeframe (primary first)",
+        ["15m", "1h", "4h", "12h", "1d"],
+        default=["1h", "4h", "1d"],
+        key="single_mtf"
+    )
 
-            st.markdown("#### 🧾 Trading Plan")
-            st.write(f"**Entry:** {res.get('entry')}")
-            st.write(f"**TP1:** {res.get('tp1')} | **TP2:** {res.get('tp2')}")
-            st.write(f"**SL:** {res.get('sl')}")
-            st.write(f"**Support:** {res.get('support')} | **Resistance:** {res.get('resistance')}")
+    # ------------------------------------------------------
+    # candles
+    # ------------------------------------------------------
+    candles_single = st.slider("Candles", min_value=200, max_value=1200, value=500, step=50)
 
-        with colR:
-            st.markdown("#### 📈 Chart")
-            dfc = decode_ohlcv_z(res.get("ohlcv_z"))
-            if isinstance(dfc, pd.DataFrame) and not dfc.empty:
-                fig = make_chart(dfc)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("No chart data available.")
+    st.markdown("---")
+
+    # ======================================================
+    # RUN SINGLE SCAN
+    # ======================================================
+    if st.button("🚀 Run Single Scan", use_container_width=True, key="single_run_btn"):
+
+        if not final_symbol:
+            st.error("Please select or input a symbol.")
+            st.stop()
+
+        try:
+            with st.spinner(f"Scanning {final_symbol} on {exchange_single} ..."):
+
+                async def run_single_async(exchange_name, symbol, mtf, limit):
+                    # create exchange
+                    if exchange_name == "binance":
+                        ex = ccxt.binance({
+                            "options": {"defaultType": "future"},
+                            "enableRateLimit": True
+                        })
+                    else:
+                        ex = ccxt.bybit({"enableRateLimit": True})
+
+                    try:
+                        # fetch multi-tf data
+                        dfs = await build_mtf_dfs_async(
+                            ex, symbol, mtf,
+                            limit_ohlcv=limit,
+                            delay=0.15
+                        )
+
+                        # find primary df
+                        primary_df = None
+                        for tf in mtf:
+                            dfcand = dfs.get(tf)
+                            if dfcand is not None and not dfcand.empty:
+                                primary_df = dfcand
+                                break
+
+                        # evaluate signal
+                        sig = signals_v4.evaluate_signals_mtf(dfs)
+
+                        # build trade plan
+                        trade_plan = None
+                        ohlcv_z = None
+
+                        if primary_df is not None and not primary_df.empty:
+                            trade_plan = _compute_trade_plan_from_df(primary_df, sig.get("signal"))
+                            ohlcv_z = compress_ohlcv(primary_df)
+
+                        # assemble result
+                        res = {
+                            "symbol": symbol,
+                            "signal": sig.get("signal"),
+                            "confidence": float(sig.get("confidence") or 0),
+                            "reasons": sig.get("reasons"),
+                            "meta": sig.get("meta"),
+                            "ohlcv_z": ohlcv_z,
+                        }
+
+                        if trade_plan:
+                            res.update(trade_plan)
+                        else:
+                            res.update({
+                                "entry": None, "tp1": None, "tp2": None,
+                                "sl": None, "support": None, "resistance": None
+                            })
+
+                        return res
+
+                    finally:
+                        try:
+                            await ex.close()
+                        except:
+                            pass
+
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                result = loop.run_until_complete(
+                    run_single_async(
+                        exchange_single,
+                        final_symbol,
+                        mtf_single or ["1h","4h","1d"],
+                        candles_single
+                    )
+                )
+
+                st.session_state["single_result"] = result
+                st.success(f"Scan completed for {final_symbol}")
+
+        except Exception as e:
+            st.error(f"Single scan failed: {e}")
+            st.code(traceback.format_exc())
+
+    # ======================================================
+    # DISPLAY RESULT
+    # ======================================================
+    if "single_result" in st.session_state:
+        res = st.session_state["single_result"]
+
+        st.subheader("📌 Trading Plan")
+        st.json(res)
+
+        dfc = decode_ohlcv_z(res.get("ohlcv_z"))
+        if dfc is not None:
+            fig = make_chart(dfc)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+
 
 # ===================================================
 # TAB 3 — Sentiment
@@ -753,4 +877,80 @@ with tab_sentiment:
     # Tampilkan HTML di Streamlit
     st.components.v1.html(calendar_html, height=800)
 
-st.caption("v4.9.1 — Dual Tab UI (Market + Single) with unified chart renderer")
+# ===================================================
+# TAB 4 — Sentiment
+# ===================================================
+with tab_ai:
+    render_chat_tab()
+
+
+# ===================================================
+# TAB 5 — Resource Monitor
+# ===================================================
+with tab_resource:
+    
+    #st_autorefresh = st.experimental_rerun if hasattr(st, "experimental_rerun") else None
+    #st.sidebar.markdown("### 🔄 Auto-refresh Resource Monitor")
+    #refresh_rate = st.sidebar.slider("Interval Refresh (detik)", 5, 60, 15)
+    #st.rerun()
+    #time.sleep(refresh_rate)
+    st.header("⚙️ Resource Usage Monitor")
+    st.caption("Pantau penggunaan CPU, Memori, dan Durasi per simbol scanner_core")
+
+    # Pastikan database performa ada
+    init_perf_db()
+
+    if os.path.exists(DB_METRIC):
+        conn = sqlite3.connect(DB_METRIC)
+        df = pd.read_sql_query("SELECT * FROM scanner_perf ORDER BY id DESC LIMIT 100", conn)
+        conn.close()
+
+        if not df.empty:
+            st.subheader("📊 Data Terbaru")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Ringkasan agregat
+            avg_cpu = df["cpu"].mean()
+            avg_mem = df["memory"].mean()
+            avg_time = df["duration"].mean()
+
+            st.markdown(f"""
+            **Rata-rata Utilisasi Terakhir:**
+            - CPU: `{avg_cpu:.2f}%`
+            - Memory: `{avg_mem:.2f} MB`
+            - Durasi: `{avg_time:.2f} detik`
+            """)
+
+            # --- Plot CPU Trend ---
+            fig_cpu = px.line(
+                df.sort_values("timestamp"),
+                x="timestamp", y="cpu", color="symbol",
+                title="CPU Usage Trend per Symbol",
+                markers=True
+            )
+            st.plotly_chart(fig_cpu, use_container_width=True)
+
+            # --- Plot Memory Trend ---
+            fig_mem = px.line(
+                df.sort_values("timestamp"),
+                x="timestamp", y="memory", color="symbol",
+                title="Memory Usage Trend per Symbol (MB)",
+                markers=True
+            )
+            st.plotly_chart(fig_mem, use_container_width=True)
+
+            # --- Plot Execution Duration ---
+            fig_time = px.bar(
+                df.sort_values("timestamp"),
+                x="symbol", y="duration", color="symbol",
+                title="Execution Time per Symbol (seconds)",
+                text_auto=".2f"
+            )
+            st.plotly_chart(fig_time, use_container_width=True)
+        else:
+            st.info("Belum ada data performa. Jalankan scanner dulu untuk merekam metrik.")
+    else:
+        st.warning("Database metrik belum dibuat. Jalankan scanner minimal sekali dulu.")
+
+
+st.caption("v4.9.2 — Dual Tab UI (Market + Single) with unified chart renderer")
