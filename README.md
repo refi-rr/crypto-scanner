@@ -44,29 +44,62 @@ Built-in defensive logic to filter out dangerous setups before they reach the da
 
 ---
 
-## 🏗 Architecture
+📂 Module Breakdown
+Core Engine (scanner/)
+scanner_core.py: The orchestrator. Manages the async event loop, triggers data fetching, runs the signal pipeline, and calculates Trade Plans (Entry/SL/TP).
 
-```mermaid
-graph TD
-    Ex["Exchange (Binance/Bybit)"] -->|Async Fetch| DF["DataFetch Module"]
-    DF -->|"OHLCV Data"| Ind["Indicators Engine"]
-    Ind -->|"Processed DF"| Sig["Signal Fusion (v4)"]
-    
-    subgraph Logic Core
-    Sig --> Trend["Trend Scoring"]
-    Sig --> Risk["Risk/Overextension Filter"]
-    end
-    
-    Logic Core -->|"JSON Result"| DB[("SQLite / JSON")]
-    
-    subgraph UI Layer
-    DB --> ST["Streamlit Dashboard"]
-    User -->|"Chat Prompt"| AI["AI Module (Ollama)"]
-    AI -->|Analysis| ST
-    end
-    
-    subgraph Monitoring
-    Res["Resource Monitor"] -->|Metrics| DB
-    Trace["OpenTelemetry"] -->|Traces| Jaeger
-    end
+signals_v4.py: The "Brain". Contains the weighted scoring logic (evaluate_signals_mtf) and the aggressive overextension filters.
+
+indicators.py: The "Math". Calculates technical indicators (Heikin Ashi, Supertrend, ADX) and detects 12+ Candlestick Patterns (Hammer, Engulfing, etc.).
+
+trend_scoring.py: Specialized logic for grading trend strength (-100 to +100).
+
+datafetch.py: Robust async data retriever with HTTP fallback to Binance Vision if CCXT fails.
+
+Infrastructure
+run_scheduler.py: Cron-like scheduler that triggers scans at specific 4-hour candle closes (07:00, 11:00, etc.).
+
+tracing_setup.py: Configures OpenTelemetry for Jaeger integration.
+
+resource_monitor.py: Tracks system performance (CPU/RAM) to prevent server overload.
+
+User Interface (ui/)
+streamlit_app.py: The frontend. Features interactive Plotly charts, signal tables with filtering, and system status indicators.
+
+ai_chat.py: Handles the interaction with the local LLM and manages chat history database.
+
+🚀 Installation & Usage
+Prerequisites
+Python 3.9+
+
+Ollama (running locally on port 11434)
+
+Jaeger Agent (optional, for tracing)
+
+Setup
+Install Dependencies:
+
+Bash
+
+pip install -r requirements.txt
+# Key deps: ccxt, pandas, streamlit, plotly, opentelemetry-api, psutil, aiohttp
+Run the Scanner (Background):
+
+Bash
+
+python -m scanner.run_scheduler
+Launch the Dashboard:
+
+Bash
+
+streamlit run ui/streamlit_app.py
+📊 Observability & Metrics
+The system logs performance data to data/scanner_metrics.db.
+
+CPU Score: CPU usage is converted to "Core Equivalent" to measure load accurately on multi-core VPS.
+
+Tracing: If configured, traces are sent to 172.24.0.2:6831 (Jaeger Host).
+
+⚠️ Disclaimer
+This software is for educational and research purposes only. Do not use it as the sole basis for your financial decisions. Futures trading involves substantial risk of loss.
 
