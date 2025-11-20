@@ -71,11 +71,13 @@ ai_chat.py: Handles the interaction with the local LLM and manages chat history 
 
 **##🚀 Installation & Usage**
 **Prerequisites**
+
 Python 3.9+
 Ollama (running locally on port 11434)
 Jaeger Agent (optional, for tracing)
 
 **Setup**
+
 Install Dependencies:
 pip install -r requirements.txt
 Key deps: ccxt, pandas, streamlit, plotly, opentelemetry-api, psutil, aiohttp
@@ -87,6 +89,7 @@ Launch the Dashboard:
 streamlit run ui/streamlit_app.py
 
 **##📊 Observability & Metrics**
+
 The system logs performance data to data/scanner_metrics.db.
 CPU Score: CPU usage is converted to "Core Equivalent" to measure load accurately on multi-core VPS.
 Tracing: If configured, traces are sent to 172.24.0.2:6831 (Jaeger Host).
