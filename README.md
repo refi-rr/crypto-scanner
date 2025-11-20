@@ -1,10 +1,10 @@
-# 🚀 AI-Augmented Crypto Futures Scanner (v2.3)
+**# 🚀 AI-Augmented Crypto Futures Scanner (v2.3)**
 
 A high-performance, asynchronous quantitative trading engine designed to detect high-probability setups in Crypto Futures markets. It features multi-timeframe analysis, weighted signal fusion, real-time observability, and a local AI assistant for market context.
 
 ---
 
-## 📋 Table of Contents
+**## 📋 Table of Contents**
 - [System Overview](#-system-overview)
 - [Key Features](#-key-features)
 - [Architecture](#-architecture)
@@ -14,13 +14,13 @@ A high-performance, asynchronous quantitative trading engine designed to detect 
 
 ---
 
-## 🔍 System Overview
+**## 🔍 System Overview**
 
 This is not a simple indicator scanner. It is a **Decision Support System (DSS)** that aggregates data from Binance/Bybit Futures, processes it through a weighted consensus engine, and presents actionable intelligence via a Streamlit Dashboard. It integrates **Local LLMs (DeepSeek/Qwen)** via Ollama to provide qualitative analysis alongside quantitative metrics.
 
 ---
 
-## ✨ Key Features
+**## ✨ Key Features**
 
 ### 1. Multi-Timeframe Signal Fusion
 The engine analyzes `1h`, `4h`, and `1d` timeframes simultaneously to find confluence.
@@ -44,7 +44,8 @@ Built-in defensive logic to filter out dangerous setups before they reach the da
 
 ---
 
-📂 Module Breakdown
+**📂 Module Breakdown**
+
 Core Engine (scanner/)
 scanner_core.py: The orchestrator. Manages the async event loop, triggers data fetching, runs the signal pipeline, and calculates Trade Plans (Entry/SL/TP).
 
@@ -68,38 +69,26 @@ streamlit_app.py: The frontend. Features interactive Plotly charts, signal table
 
 ai_chat.py: Handles the interaction with the local LLM and manages chat history database.
 
-🚀 Installation & Usage
-Prerequisites
+**🚀 Installation & Usage**
+**Prerequisites**
 Python 3.9+
-
 Ollama (running locally on port 11434)
-
 Jaeger Agent (optional, for tracing)
 
-Setup
+**Setup**
 Install Dependencies:
-
-Bash
-
 pip install -r requirements.txt
 # Key deps: ccxt, pandas, streamlit, plotly, opentelemetry-api, psutil, aiohttp
+
 Run the Scanner (Background):
-
-Bash
-
 python -m scanner.run_scheduler
+
 Launch the Dashboard:
-
-Bash
-
 streamlit run ui/streamlit_app.py
-📊 Observability & Metrics
+
+**📊 Observability & Metrics**
 The system logs performance data to data/scanner_metrics.db.
 
 CPU Score: CPU usage is converted to "Core Equivalent" to measure load accurately on multi-core VPS.
 
 Tracing: If configured, traces are sent to 172.24.0.2:6831 (Jaeger Host).
-
-⚠️ Disclaimer
-This software is for educational and research purposes only. Do not use it as the sole basis for your financial decisions. Futures trading involves substantial risk of loss.
-
