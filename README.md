@@ -48,26 +48,26 @@ Built-in defensive logic to filter out dangerous setups before they reach the da
 
 ```mermaid
 graph TD
-    Ex[Exchange (Binance/Bybit)] -->|Async Fetch| DF[DataFetch Module]
-    DF -->|OHLCV Data| Ind[Indicators Engine]
-    Ind -->|Processed DF| Sig[Signal Fusion (v4)]
+    Ex["Exchange (Binance/Bybit)"] -->|Async Fetch| DF["DataFetch Module"]
+    DF -->|"OHLCV Data"| Ind["Indicators Engine"]
+    Ind -->|"Processed DF"| Sig["Signal Fusion (v4)"]
     
     subgraph Logic Core
-    Sig --> Trend[Trend Scoring]
-    Sig --> Risk[Risk/Overextension Filter]
+    Sig --> Trend["Trend Scoring"]
+    Sig --> Risk["Risk/Overextension Filter"]
     end
     
-    Logic Core -->|JSON Result| DB[(SQLite / JSON)]
+    Logic Core -->|"JSON Result"| DB[("SQLite / JSON")]
     
     subgraph UI Layer
-    DB --> ST[Streamlit Dashboard]
-    User -->|Chat Prompt| AI[AI Module (Ollama)]
+    DB --> ST["Streamlit Dashboard"]
+    User -->|"Chat Prompt"| AI["AI Module (Ollama)"]
     AI -->|Analysis| ST
     end
     
     subgraph Monitoring
-    Res[Resource Monitor] -->|Metrics| DB
-    Trace[OpenTelemetry] -->|Traces| Jaeger
+    Res["Resource Monitor"] -->|Metrics| DB
+    Trace["OpenTelemetry"] -->|Traces| Jaeger
     end
 
 
